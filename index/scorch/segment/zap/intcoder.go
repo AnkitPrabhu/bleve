@@ -18,7 +18,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
+	"math"
 )
+
+const termNotEncoded = math.MaxUint64
+
+// ChunkCoalescingFactor decides the chunk coaleascing limit
+var ChunkCoalescingFactor = uint64(512)
 
 type chunkedIntCoder struct {
 	final     []byte
@@ -27,7 +33,9 @@ type chunkedIntCoder struct {
 	chunkLens []uint64
 	currChunk uint64
 
-	buf []byte
+	docFreq   uint64
+	maxDocNum int64
+	buf       []byte
 }
 
 // newChunkedIntCoder returns a new chunk int coder which packs data into
@@ -37,6 +45,7 @@ func newChunkedIntCoder(chunkSize uint64, maxDocNum uint64) *chunkedIntCoder {
 	total := maxDocNum/chunkSize + 1
 	rv := &chunkedIntCoder{
 		chunkSize: chunkSize,
+		maxDocNum: -1,
 		chunkLens: make([]uint64, total),
 		final:     make([]byte, 0, 64),
 	}
@@ -50,6 +59,8 @@ func (c *chunkedIntCoder) Reset() {
 	c.final = c.final[:0]
 	c.chunkBuf.Reset()
 	c.currChunk = 0
+	c.docFreq = 0
+	c.maxDocNum = -1
 	for i := range c.chunkLens {
 		c.chunkLens[i] = 0
 	}
@@ -64,6 +75,11 @@ func (c *chunkedIntCoder) Add(docNum uint64, vals ...uint64) error {
 		c.Close()
 		c.chunkBuf.Reset()
 		c.currChunk = chunk
+	}
+
+	if int64(docNum) > c.maxDocNum {
+		c.maxDocNum = int64(docNum)
+		c.docFreq++
 	}
 
 	if len(c.buf) < binary.MaxVarintLen64 {
@@ -90,6 +106,11 @@ func (c *chunkedIntCoder) AddBytes(docNum uint64, buf []byte) error {
 		c.currChunk = chunk
 	}
 
+	if int64(docNum) > c.maxDocNum {
+		c.maxDocNum = int64(docNum)
+		c.docFreq++
+	}
+
 	_, err := c.chunkBuf.Write(buf)
 	return err
 }
@@ -103,19 +124,45 @@ func (c *chunkedIntCoder) Close() {
 	c.currChunk = uint64(cap(c.chunkLens)) // sentinel to detect double close
 }
 
+func (c *chunkedIntCoder) checkChunkCoalescing() bool {
+	if c.docFreq != 0 && c.docFreq < ChunkCoalescingFactor {
+		var endOffset uint64
+		for _, i := range c.chunkLens {
+			endOffset += i
+		}
+		c.chunkLens[0] = endOffset
+		return true
+	}
+	return false
+}
+
 // Write commits all the encoded chunked integers to the provided writer.
 func (c *chunkedIntCoder) Write(w io.Writer) (int, error) {
-	bufNeeded := binary.MaxVarintLen64 * (1 + len(c.chunkLens))
+	if len(c.final) <= 0 {
+		return 0, nil
+	}
+
+	bufNeeded := binary.MaxVarintLen64 * (2 + len(c.chunkLens))
 	if len(c.buf) < bufNeeded {
 		c.buf = make([]byte, bufNeeded)
 	}
 	buf := c.buf
 
-	// convert the chunk lengths into chunk offsets
-	chunkOffsets := modifyLengthsToEndOffsets(c.chunkLens)
+	coalesced := c.checkChunkCoalescing()
+	// write out the dynamic chunk factor
+	var n int
+	var chunkOffsets []uint64
+	if coalesced {
+		// convert the chunk lengths into chunk offsets
+		chunkOffsets = modifyLengthsToEndOffsets(c.chunkLens[:1])
+		n = binary.PutUvarint(buf, uint64(c.maxDocNum+1))
+	} else {
+		chunkOffsets = modifyLengthsToEndOffsets(c.chunkLens)
+		n = binary.PutUvarint(buf, uint64(1024))
+	}
 
 	// write out the number of chunks & each chunk offsets
-	n := binary.PutUvarint(buf, uint64(len(chunkOffsets)))
+	n += binary.PutUvarint(buf[n:], uint64(len(chunkOffsets)))
 	for _, chunkOffset := range chunkOffsets {
 		n += binary.PutUvarint(buf[n:], chunkOffset)
 	}
